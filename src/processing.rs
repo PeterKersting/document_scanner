@@ -161,16 +161,81 @@ pub fn crop_to_quad(img: &RgbImage, q: &Quad) -> RgbImage {
 }
 
 /// Converts the scan to the requested colour mode.
+///
+/// Black & white pages are kept in grayscale here; the threshold is chosen in
+/// the preview and applied when saving (see [`threshold`]).
 pub fn apply_color_mode(img: RgbImage, mode: ColorMode) -> DynamicImage {
     match mode {
         ColorMode::Color => DynamicImage::ImageRgb8(img),
-        ColorMode::Gray => DynamicImage::ImageRgb8(img).into_luma8().into(),
-        ColorMode::BlackWhite => {
-            let gray = DynamicImage::ImageRgb8(img).into_luma8();
-            let level = imageproc::contrast::otsu_level(&gray);
-            imageproc::contrast::threshold(&gray, level, imageproc::contrast::ThresholdType::Binary).into()
+        ColorMode::Gray | ColorMode::BlackWhite => DynamicImage::ImageRgb8(img).into_luma8().into(),
+    }
+}
+
+/// Picks a black & white threshold for a document page.
+///
+/// Assumes that most of the page is paper and only a small part is ink: the
+/// paper level is the median brightness, the ink level the darkest percent.
+/// The threshold lies a bit past the middle between both, towards the paper,
+/// so thin and light strokes stay black while paper texture turns white.
+/// A 4 % margin is ignored (scanner shadows, feeder edges).
+pub fn auto_threshold(img: &DynamicImage) -> u8 {
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let step = ((w.max(h) / 1500).max(1)) as usize;
+    let (mx, my) = (w / 25, h / 25);
+    let mut hist = [0u64; 256];
+    let mut total = 0u64;
+    for y in (my..h.saturating_sub(my)).step_by(step) {
+        for x in (mx..w.saturating_sub(mx)).step_by(step) {
+            hist[gray.get_pixel(x, y)[0] as usize] += 1;
+            total += 1;
         }
     }
+    if total == 0 {
+        return 128;
+    }
+    let percentile = |p: f64| -> i32 {
+        let target = (total as f64 * p).ceil() as u64;
+        let mut acc = 0;
+        for (v, n) in hist.iter().enumerate() {
+            acc += n;
+            if acc >= target.max(1) {
+                return v as i32;
+            }
+        }
+        255
+    };
+    let paper = percentile(0.5);
+    let ink = percentile(0.01);
+    if paper - ink < 60 {
+        // Hardly any ink (blank or very faint page): keep only clear marks.
+        return (paper - 60).clamp(1, 254) as u8;
+    }
+    (ink as f32 + (paper - ink) as f32 * 0.6).round().clamp(1.0, 254.0) as u8
+}
+
+/// Lookup table for brightness and contrast, both −100…100 (0 = unchanged).
+/// Contrast stretches around mid-gray, brightness shifts the result.
+pub fn tone_lut(brightness: f32, contrast: f32) -> [u8; 256] {
+    let c = contrast.clamp(-100.0, 100.0) * 2.55;
+    let factor = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
+    let shift = brightness.clamp(-100.0, 100.0) * 1.28;
+    std::array::from_fn(|v| ((v as f32 - 128.0) * factor + 128.0 + shift).round().clamp(0.0, 255.0) as u8)
+}
+
+/// Applies brightness and contrast to a grayscale page.
+pub fn adjust_gray(img: &DynamicImage, brightness: f32, contrast: f32) -> DynamicImage {
+    let lut = tone_lut(brightness, contrast);
+    let mut gray = img.to_luma8();
+    gray.pixels_mut().for_each(|p| p.0[0] = lut[p.0[0] as usize]);
+    DynamicImage::ImageLuma8(gray)
+}
+
+/// Turns a page into pure black and white: pixels darker than `level` become black.
+pub fn threshold(img: &DynamicImage, level: u8) -> DynamicImage {
+    let mut gray = img.to_luma8();
+    gray.pixels_mut().for_each(|p| p.0[0] = if p.0[0] < level { 0 } else { 255 });
+    DynamicImage::ImageLuma8(gray)
 }
 
 /// Prepares a raw scan: applies the colour mode and detects the page edges.
@@ -265,6 +330,49 @@ mod tests {
             }
         }
         assert!(!is_blank(&img));
+    }
+
+    /// A page of `paper` brightness with some noise and `coverage` of it in `ink`.
+    fn text_page(paper: u8, ink: u8, coverage: f32) -> DynamicImage {
+        let mut img = image::GrayImage::from_pixel(1000, 1400, image::Luma([paper]));
+        let mut seed = 7u32;
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let noise = ((seed >> 16) % 13) as i32 - 6;
+            // "Lines of text": short dashes on every 40th row band.
+            let in_text = (y % 40) < 12 && (x % 25) < (25.0 * coverage * 40.0 / 12.0) as u32 && x > 80 && x < 920;
+            let v = if in_text { ink as i32 } else { paper as i32 } + noise;
+            p.0[0] = v.clamp(0, 255) as u8;
+        }
+        DynamicImage::ImageLuma8(img)
+    }
+
+    #[test]
+    fn auto_threshold_separates_text_from_paper() {
+        for (paper, ink) in [(245, 30), (230, 90), (240, 160), (200, 60)] {
+            let page = text_page(paper, ink, 0.05);
+            let t = auto_threshold(&page) as i32;
+            assert!(t > ink as i32 + 10 && t < paper as i32 - 10, "paper {paper}, ink {ink}: {t}");
+            let bw = threshold(&page, t as u8).into_luma8();
+            let black = bw.pixels().filter(|p| p.0[0] == 0).count() as f32 / (bw.width() * bw.height()) as f32;
+            assert!((0.02..0.08).contains(&black), "paper {paper}, ink {ink}: {black}");
+        }
+        // A blank page stays white.
+        let blank = text_page(240, 240, 0.0);
+        let bw = threshold(&blank, auto_threshold(&blank)).into_luma8();
+        assert!(bw.pixels().all(|p| p.0[0] == 255));
+    }
+
+    #[test]
+    fn tone_curve() {
+        let same = tone_lut(0.0, 0.0);
+        assert!(same.iter().enumerate().all(|(i, v)| *v as usize == i));
+        let bright = tone_lut(50.0, 0.0);
+        assert_eq!(bright[100], 164);
+        let steep = tone_lut(0.0, 50.0);
+        assert!(steep[64] < 64 && steep[192] > 192 && steep[128] == 128);
+        let flat = tone_lut(0.0, -100.0);
+        assert!(flat.iter().all(|v| *v == 128));
     }
 
     #[test]

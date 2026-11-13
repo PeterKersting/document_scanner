@@ -1,7 +1,8 @@
 //! Writing scan results to a temporary folder (PDF with OCR, JPEG, PNG) and
 //! moving them to their final location.
 
-use crate::config::{OutputFormat, ScanSettings};
+use crate::config::{ColorMode, OutputFormat, ScanSettings};
+use crate::processing;
 use anyhow::{bail, Context, Result};
 use image::codecs::jpeg::{JpegEncoder, PixelDensity};
 use image::{DynamicImage, ExtendedColorType};
@@ -30,6 +31,9 @@ pub struct ScannedDocument {
     pub pages: Vec<ScannedPage>,
     /// Pages per document: 2 for duplex feeder scans (front + back), else 1.
     pub pages_per_doc: usize,
+    /// Colour mode the pages were scanned in. Black & white pages are kept in
+    /// grayscale until saving (see [`Tone::Threshold`]).
+    pub color: ColorMode,
 }
 
 impl ScannedDocument {
@@ -45,6 +49,7 @@ impl ScannedDocument {
             resolution,
             pages,
             pages_per_doc: pages_per_doc.max(1),
+            color: ColorMode::Color,
         })
     }
 
@@ -121,9 +126,33 @@ pub fn rotate_degrees(img: &DynamicImage, degrees: f32, bilevel: bool) -> Dynami
     }
 }
 
+/// Tonal adjustment of a page, applied before rotating and cropping.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Tone {
+    /// Unchanged (or automatic threshold for black & white scans).
+    #[default]
+    None,
+    /// Grayscale brightness and contrast, both −100…100.
+    Adjust { brightness: f32, contrast: f32 },
+    /// Black & white: pixels darker than this level become black.
+    Threshold(u8),
+}
+
+impl Tone {
+    pub fn apply<'a>(self, img: &'a DynamicImage) -> Cow<'a, DynamicImage> {
+        match self {
+            Tone::None => Cow::Borrowed(img),
+            Tone::Adjust { brightness, contrast } if brightness == 0.0 && contrast == 0.0 => Cow::Borrowed(img),
+            Tone::Adjust { brightness, contrast } => Cow::Owned(processing::adjust_gray(img, brightness, contrast)),
+            Tone::Threshold(level) => Cow::Owned(processing::threshold(img, level)),
+        }
+    }
+}
+
 /// Changes the user made to one page in the preview.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PageEdit {
+    pub tone: Tone,
     /// Rotation in degrees, clockwise; applied before the crop.
     pub rotation: f32,
     /// Manual crop as normalised `[x0, y0, x1, y1]` (0…1) of the rotated page.
@@ -342,11 +371,16 @@ pub fn build(
     let image = |i: usize| -> Cow<DynamicImage> {
         let img = doc.page(i, settings.auto_crop);
         let edit = edits.get(i).copied().unwrap_or_default();
-        let bilevel = settings.color == crate::config::ColorMode::BlackWhite;
+        let tone = match (edit.tone, doc.color) {
+            (Tone::None, ColorMode::BlackWhite) => Tone::Threshold(processing::auto_threshold(img)),
+            (t, _) => t,
+        };
+        let bilevel = matches!(tone, Tone::Threshold(_));
+        let img = tone.apply(img);
         let img = if edit.rotation.abs() >= 0.005 {
-            Cow::Owned(rotate_degrees(img, edit.rotation, bilevel))
+            Cow::Owned(rotate_degrees(&img, edit.rotation, bilevel))
         } else {
-            Cow::Borrowed(img)
+            img
         };
         match edit.crop {
             Some(c) => Cow::Owned(crop_normalized(&img, c)),
@@ -550,6 +584,50 @@ mod tests {
         assert_eq!(out.get_pixel(x.round() as u32, y.round() as u32).0[0], 0);
         assert!(out.pixels().all(|p| p.0[0] == 0 || p.0[0] == 255), "stays bilevel");
         assert_eq!(out.get_pixel(0, 0).0[0], 255, "corners are white");
+    }
+
+    /// Gray page with a dark bar, scanned in `color` mode.
+    fn bar_doc(color: ColorMode) -> ScannedDocument {
+        let mut gray = image::GrayImage::from_pixel(200, 280, image::Luma([235]));
+        for y in 100..110 {
+            for x in 30..170 {
+                gray.put_pixel(x, y, image::Luma([60]));
+            }
+        }
+        let page = ScannedPage { full: DynamicImage::ImageLuma8(gray), cropped: None, blank: false };
+        let mut doc = ScannedDocument::new(vec![page], 75, 1).unwrap();
+        doc.color = color;
+        doc
+    }
+
+    #[test]
+    fn black_and_white_is_thresholded_when_saving() {
+        let doc = bar_doc(ColorMode::BlackWhite);
+        let s = ScanSettings { format: OutputFormat::Png, ..Default::default() };
+        let groups = output_groups(&doc, &s, &HashSet::new());
+        // Automatic threshold.
+        let built = build(&doc, &s, &[], &groups, &|_| {}).unwrap();
+        let out = image::open(&built.files[0]).unwrap().into_luma8();
+        assert!(out.pixels().all(|p| p.0[0] == 0 || p.0[0] == 255));
+        assert_eq!(out.get_pixel(100, 105).0[0], 0);
+        assert_eq!(out.get_pixel(100, 20).0[0], 255);
+        // A threshold below the bar's gray leaves the page white.
+        let edit = PageEdit { tone: Tone::Threshold(50), ..Default::default() };
+        let built = build(&doc, &s, &[edit], &groups, &|_| {}).unwrap();
+        let out = image::open(&built.files[0]).unwrap().into_luma8();
+        assert!(out.pixels().all(|p| p.0[0] == 255));
+    }
+
+    #[test]
+    fn grayscale_brightness_is_applied_when_saving() {
+        let doc = bar_doc(ColorMode::Gray);
+        let s = ScanSettings { format: OutputFormat::Png, ..Default::default() };
+        let groups = output_groups(&doc, &s, &HashSet::new());
+        let edit = PageEdit { tone: Tone::Adjust { brightness: -20.0, contrast: 0.0 }, ..Default::default() };
+        let built = build(&doc, &s, &[edit], &groups, &|_| {}).unwrap();
+        let out = image::open(&built.files[0]).unwrap().into_luma8();
+        assert_eq!(out.get_pixel(100, 20).0[0], 235 - 26);
+        assert_eq!(out.get_pixel(100, 105).0[0], 60 - 26);
     }
 
     #[test]

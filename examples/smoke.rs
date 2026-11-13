@@ -39,7 +39,8 @@ fn process(pages: Vec<image::RgbImage>, settings: &ScanSettings) -> anyhow::Resu
         .into_iter()
         .map(|p| processing::process_page(p, settings.color))
         .collect();
-    let doc = output::ScannedDocument::new(processed, settings.resolution, 1)?;
+    let mut doc = output::ScannedDocument::new(processed, settings.resolution, 1)?;
+    doc.color = settings.color;
     println!("edges found on {} page(s)", doc.edges_found());
     let result = output::build(&doc, settings, &[], &output::output_groups(&doc, settings, &Default::default()), &|m| println!("  {m}"))?;
     println!("notes: {:?}", result.notes);

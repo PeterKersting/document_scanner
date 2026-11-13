@@ -123,6 +123,9 @@ pub struct ScanSettings {
     pub skip_blank: bool,
     /// Put all scanned documents into one PDF instead of one PDF each.
     pub combine_pdf: bool,
+    /// Grayscale brightness and contrast, −100…100 (0 = unchanged).
+    pub brightness: f32,
+    pub contrast: f32,
 }
 
 impl Default for ScanSettings {
@@ -139,6 +142,8 @@ impl Default for ScanSettings {
             jpeg_quality: 85,
             skip_blank: true,
             combine_pdf: true,
+            brightness: 0.0,
+            contrast: 0.0,
         }
     }
 }

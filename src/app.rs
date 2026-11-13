@@ -2,9 +2,9 @@
 //! 1 scanner → 2 scan settings & scan → 3 preview → 4 output format & save.
 //! The central area only shows the zoomable / pannable page preview.
 
-use crate::config::{Config, OutputFormat, PageSize, Source};
+use crate::config::{ColorMode, Config, OutputFormat, PageSize, Source};
 use crate::naming;
-use crate::output::{self, BuiltOutput, ScannedDocument};
+use crate::output::{self, BuiltOutput, ScannedDocument, Tone};
 use crate::processing;
 use crate::scanner::{self, Capabilities, ScannerInfo};
 use egui::{Color32, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
@@ -41,6 +41,8 @@ impl Default for View {
 
 struct PageTexture {
     handle: TextureHandle,
+    /// Tone the texture was made with; it is rebuilt when this changes.
+    tone: Tone,
     /// Size of the full-resolution page in pixels.
     size: Vec2,
 }
@@ -95,11 +97,17 @@ pub struct ScanApp {
     crop_mode: bool,
     /// The expanded group in the left panel (at most one).
     open_section: Option<Section>,
+    /// Black & white threshold chosen by the user for all pages; `None` = automatic per page.
+    threshold: Option<u8>,
+    /// Automatic threshold per (page, uses auto-cropped image).
+    auto_thresholds: HashMap<(usize, bool), u8>,
     /// Rotation in degrees (clockwise) per (page, uses auto-cropped image).
     rotations: HashMap<(usize, bool), f32>,
     /// Pages the user deleted from the scan, in deletion order (for undo).
     deleted: Vec<usize>,
     name: String,
+    /// Name for the first scan, taken from a new file named on the command line.
+    start_name: Option<String>,
 
     message: Option<(String, MsgKind)>,
     last_saved: Option<PathBuf>,
@@ -109,10 +117,48 @@ pub struct ScanApp {
 }
 
 impl ScanApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `start_file` is a file named on the command line: its folder becomes the
+    /// save folder and its name the next document name.
+    pub fn new(cc: &eframe::CreationContext<'_>, start_file: Option<PathBuf>) -> Self {
         let mut app = Self::with_config(Config::load());
+        if let Some(path) = start_file {
+            app.apply_start_file(&path);
+        }
         app.start_discovery(&cc.egui_ctx);
         app
+    }
+
+    /// Takes the save folder and document name from `path`.
+    ///
+    /// For an existing file the next name in its sequence is proposed
+    /// (`invoice3.pdf` → `invoice4`); for a new file its own name is used.
+    /// A folder only sets the save folder.
+    fn apply_start_file(&mut self, path: &Path) {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if path.is_dir() {
+            self.config.target_dir = Some(path.clone());
+            self.message = Some((format!("Save folder: {}", path.display()), MsgKind::Info));
+            return;
+        }
+        let Some(dir) = path.parent().filter(|d| d.is_dir()) else {
+            self.message = Some((format!("Folder not found: {}", path.display()), MsgKind::Error));
+            return;
+        };
+        let stem = path.file_stem().map(|s| naming::sanitize(&s.to_string_lossy())).unwrap_or_default();
+        self.config.target_dir = Some(dir.to_path_buf());
+        if stem.is_empty() {
+            return;
+        }
+        let name = if path.exists() {
+            self.config.last_name = stem;
+            self.start_name = None;
+            naming::next_name(&self.config.last_name)
+        } else {
+            self.start_name = Some(stem.clone());
+            stem
+        };
+        self.name = name.clone();
+        self.message = Some((format!("Next scan will be saved as “{name}” in {}.", dir.display()), MsgKind::Info));
     }
 
     fn with_config(config: Config) -> Self {
@@ -135,10 +181,13 @@ impl ScanApp {
             zoom_request: None,
             manual_crops: HashMap::new(),
             rotations: HashMap::new(),
+            threshold: None,
+            auto_thresholds: HashMap::new(),
             open_section,
             deleted: Vec::new(),
             crop_mode: false,
             name: String::new(),
+            start_name: None,
             message: None,
             last_saved: None,
             manual_url: String::new(),
@@ -283,7 +332,9 @@ impl ScanApp {
                     pages.push(processing::process_page(img, settings.color));
                 }
                 let pages_per_doc = if settings.source == Source::FeederDuplex { 2 } else { 1 };
-                ScannedDocument::new(pages, settings.resolution, pages_per_doc)
+                let mut doc = ScannedDocument::new(pages, settings.resolution, pages_per_doc)?;
+                doc.color = settings.color;
+                Ok(doc)
             };
             let result = run().map_err(|e| format!("{e:#}"));
             let _ = tx.send(JobMsg::Scanned(result));
@@ -296,12 +347,16 @@ impl ScanApp {
         self.textures.clear();
         self.manual_crops.clear();
         self.rotations.clear();
+        self.threshold = None;
+        self.auto_thresholds.clear();
         self.deleted.clear();
         self.crop_mode = false;
         self.open_section = Some(Section::Preview);
         self.page = 0;
         self.view = View::default();
-        self.name = if self.config.last_name.trim().is_empty() {
+        self.name = if let Some(name) = self.start_name.take() {
+            name
+        } else if self.config.last_name.trim().is_empty() {
             "scan".to_string()
         } else {
             naming::next_name(&self.config.last_name)
@@ -352,6 +407,37 @@ impl ScanApp {
 
     fn rotation(&self, i: usize) -> f32 {
         self.rotations.get(&self.page_key(i)).copied().unwrap_or(0.0)
+    }
+
+    /// Automatic black & white threshold of page `i` (computed once).
+    fn auto_threshold(&mut self, i: usize) -> u8 {
+        let key = self.page_key(i);
+        if let Some(t) = self.auto_thresholds.get(&key) {
+            return *t;
+        }
+        let Some(doc) = self.doc.clone() else { return 128 };
+        let t = processing::auto_threshold(doc.page(i, key.1));
+        self.auto_thresholds.insert(key, t);
+        t
+    }
+
+    /// Tonal adjustment for page `i`, depending on the colour mode of the scan.
+    fn page_tone(&mut self, i: usize) -> Tone {
+        match self.doc.as_ref().map(|d| d.color) {
+            Some(ColorMode::Gray) => {
+                let s = &self.config.settings;
+                if s.brightness == 0.0 && s.contrast == 0.0 {
+                    Tone::None
+                } else {
+                    Tone::Adjust { brightness: s.brightness, contrast: s.contrast }
+                }
+            }
+            Some(ColorMode::BlackWhite) => Tone::Threshold(match self.threshold {
+                Some(t) => t,
+                None => self.auto_threshold(i),
+            }),
+            _ => Tone::None,
+        }
     }
 
     fn set_rotation(&mut self, degrees: f32) {
@@ -480,6 +566,7 @@ impl ScanApp {
         let settings = self.config.settings.clone();
         let edits: Vec<output::PageEdit> = (0..doc.pages.len())
             .map(|i| output::PageEdit {
+                tone: self.page_tone(i),
                 rotation: self.rotation(i),
                 crop: self.manual_crops.get(&self.page_key(i)).map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]),
             })
@@ -839,6 +926,9 @@ impl ScanApp {
         });
 
         ui.add_space(4.0);
+        self.tone_controls(ui, busy, doc.color);
+
+        ui.add_space(4.0);
         ui.add_enabled_ui(!busy, |ui| {
             let mut rot = self.rotation(self.page);
             ui.horizontal(|ui| {
@@ -881,6 +971,65 @@ impl ScanApp {
             self.crop_mode = false;
             self.open_section = Some(Section::Save);
         }
+    }
+
+    fn tone_slider(value: &mut f32, range: std::ops::RangeInclusive<f32>) -> egui::Slider<'_> {
+        egui::Slider::new(value, range).step_by(1.0).fixed_decimals(0).clamping(egui::SliderClamping::Always)
+    }
+
+    /// Brightness / contrast for grayscale scans, threshold for black & white.
+    fn tone_controls(&mut self, ui: &mut egui::Ui, busy: bool, color: ColorMode) {
+        ui.add_enabled_ui(!busy, |ui| match color {
+            ColorMode::Gray => {
+                egui::Grid::new("tone").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                    ui.spacing_mut().slider_width = 150.0;
+                    let s = &mut self.config.settings;
+                    ui.label("Brightness");
+                    ui.add(Self::tone_slider(&mut s.brightness, -100.0..=100.0));
+                    ui.end_row();
+                    ui.label("Contrast");
+                    ui.add(Self::tone_slider(&mut s.contrast, -100.0..=100.0));
+                    ui.end_row();
+                });
+                let s = &mut self.config.settings;
+                let changed = s.brightness != 0.0 || s.contrast != 0.0;
+                if ui.add_enabled(changed, egui::Button::new("Reset brightness & contrast")).clicked() {
+                    s.brightness = 0.0;
+                    s.contrast = 0.0;
+                }
+            }
+            ColorMode::BlackWhite => {
+                let auto = self.auto_threshold(self.page);
+                let mut level = self.threshold.map_or(auto as f32, f32::from);
+                ui.horizontal(|ui| {
+                    ui.label("Threshold");
+                    ui.spacing_mut().slider_width = 150.0;
+                    if ui
+                        .add(Self::tone_slider(&mut level, 1.0..=254.0))
+                        .on_hover_text("Pixels darker than this become black. Lower = thinner, lighter text.")
+                        .changed()
+                    {
+                        self.threshold = Some(level.round() as u8);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut is_auto = self.threshold.is_none();
+                    if ui
+                        .checkbox(&mut is_auto, "Automatic")
+                        .on_hover_text("Chooses the level per page from the brightness of paper and text.")
+                        .changed()
+                    {
+                        self.threshold = if is_auto { None } else { Some(auto) };
+                    }
+                    if self.threshold.is_none() {
+                        ui.small(format!("this page: {auto}"));
+                    } else {
+                        ui.small("same level for all pages");
+                    }
+                });
+            }
+            ColorMode::Color => {}
+        });
     }
 
     fn save_section(&mut self, ui: &mut egui::Ui, busy: bool) {
@@ -1075,8 +1224,9 @@ impl ScanApp {
     fn texture(&mut self, ctx: &egui::Context, i: usize, crop: bool) -> Option<(egui::TextureId, Vec2)> {
         let doc = self.doc.clone()?;
         let key = (i, crop && doc.pages[i].cropped.is_some());
-        if !self.textures.contains_key(&key) {
-            let img = doc.page(i, key.1);
+        let tone = self.page_tone(i);
+        if self.textures.get(&key).is_none_or(|t| t.tone != tone) {
+            let img = tone.apply(doc.page(i, key.1));
             let size = Vec2::new(img.width() as f32, img.height() as f32);
             let max_side = ctx.input(|inp| inp.max_texture_side) as u32;
             let rgba = if img.width().max(img.height()) > max_side {
@@ -1087,7 +1237,7 @@ impl ScanApp {
             let color = egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
             let options = TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
             let handle = ctx.load_texture(format!("page-{i}-{}", key.1), color, options);
-            self.textures.insert(key, PageTexture { handle, size });
+            self.textures.insert(key, PageTexture { handle, tone, size });
         }
         self.textures.get(&key).map(|t| (t.handle.id(), t.size))
     }
@@ -1564,6 +1714,88 @@ mod tests {
         assert_eq!(app.rotation(1), 0.0, "other pages are not affected");
         app.set_rotation(0.0);
         assert!(app.rotations.is_empty());
+    }
+
+    #[test]
+    fn start_file_sets_folder_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = || ScannedPage {
+            full: image::DynamicImage::ImageRgb8(image::RgbImage::new(20, 30)),
+            cropped: None,
+            blank: false,
+        };
+
+        // A file that does not exist yet: its name is used as is.
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        app.apply_start_file(&dir.path().join("Rechnung Mai.pdf"));
+        assert_eq!(app.config.target_dir.as_deref(), Some(dir.path()));
+        app.show_document(ScannedDocument::new(vec![page()], 75, 1).unwrap());
+        assert_eq!(app.name, naming::sanitize("Rechnung Mai"));
+        app.discard_document();
+        app.config.last_name = app.name.clone(); // as after saving
+        app.show_document(ScannedDocument::new(vec![page()], 75, 1).unwrap());
+        assert_ne!(app.name, naming::sanitize("Rechnung Mai"), "only the first scan uses it");
+
+        // An existing file: the next name in its sequence.
+        std::fs::write(dir.path().join("invoice3.pdf"), b"x").unwrap();
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        app.apply_start_file(&dir.path().join("invoice3.pdf"));
+        assert_eq!(app.config.last_name, "invoice3");
+        app.show_document(ScannedDocument::new(vec![page()], 75, 1).unwrap());
+        assert_eq!(app.name, "invoice4");
+
+        // A folder only sets the save folder.
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        app.config.last_name = "doc".into();
+        app.apply_start_file(dir.path());
+        assert_eq!(app.config.target_dir.as_deref(), Some(dir.path()));
+        assert_eq!(app.config.last_name, "doc");
+    }
+
+    #[test]
+    fn tone_follows_colour_mode() {
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        let text_page = || {
+            let mut img = image::RgbImage::from_pixel(200, 280, image::Rgb([240, 240, 240]));
+            for y in (40..240).step_by(20) {
+                for x in 30..170 {
+                    for dy in 0..4 {
+                        img.put_pixel(x, y + dy, image::Rgb([40, 40, 40]));
+                    }
+                }
+            }
+            processing::process_page(img, ColorMode::BlackWhite)
+        };
+        let mut doc = ScannedDocument::new(vec![text_page(), text_page()], 75, 1).unwrap();
+        doc.color = ColorMode::BlackWhite;
+        app.show_document(doc);
+        assert!(matches!(app.doc.as_ref().unwrap().pages[0].full, image::DynamicImage::ImageLuma8(_)), "kept in gray");
+        let Tone::Threshold(auto) = app.page_tone(0) else { panic!() };
+        assert!((90..220).contains(&auto), "{auto}");
+        app.threshold = Some(77);
+        assert_eq!(app.page_tone(1), Tone::Threshold(77), "manual level applies to all pages");
+
+        // Preview textures follow the tone; the panel renders and keeps its width.
+        let ctx = egui::Context::default();
+        let w = run_frames(&mut app, &ctx, 3);
+        assert_eq!(app.textures.values().next().unwrap().tone, Tone::Threshold(77));
+        app.threshold = None;
+        let w2 = run_frames(&mut app, &ctx, 3);
+        assert_eq!(app.textures.values().next().unwrap().tone, Tone::Threshold(auto));
+        assert_eq!(w, w2);
+
+        // Grayscale scans get brightness and contrast instead.
+        let mut doc = ScannedDocument::new(vec![text_page()], 75, 1).unwrap();
+        doc.color = ColorMode::Gray;
+        app.show_document(doc);
+        assert_eq!(app.page_tone(0), Tone::None);
+        app.config.settings.brightness = 10.0;
+        assert_eq!(app.page_tone(0), Tone::Adjust { brightness: 10.0, contrast: 0.0 });
+        run_frames(&mut app, &ctx, 2);
     }
 
     #[test]
