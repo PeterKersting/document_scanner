@@ -42,8 +42,9 @@ impl Default for View {
 
 struct PageTexture {
     handle: TextureHandle,
-    /// Tone the texture was made with; it is rebuilt when this changes.
+    /// Tone and quarter turns the texture was made with; it is rebuilt when they change.
     tone: Tone,
+    turns: u8,
     /// Size of the full-resolution page in pixels.
     size: Vec2,
 }
@@ -108,6 +109,8 @@ pub struct ScanApp {
     auto_thresholds: HashMap<(usize, bool), u8>,
     /// Rotation in degrees (clockwise) per (page, uses auto-cropped image).
     rotations: HashMap<(usize, bool), f32>,
+    /// Quarter turns clockwise (1…3) per (page, uses auto-cropped image).
+    quarter_turns: HashMap<(usize, bool), u8>,
     /// Pages the user deleted from the scan, in deletion order (for undo).
     deleted: Vec<usize>,
     name: String,
@@ -206,6 +209,7 @@ impl ScanApp {
             zoom_request: None,
             manual_crops: HashMap::new(),
             rotations: HashMap::new(),
+            quarter_turns: HashMap::new(),
             threshold: None,
             auto_thresholds: HashMap::new(),
             open_section,
@@ -374,6 +378,7 @@ impl ScanApp {
         self.textures.clear();
         self.manual_crops.clear();
         self.rotations.clear();
+        self.quarter_turns.clear();
         self.threshold = None;
         self.auto_thresholds.clear();
         self.deleted.clear();
@@ -414,6 +419,7 @@ impl ScanApp {
         self.textures.clear();
         self.manual_crops.clear();
         self.rotations.clear();
+        self.quarter_turns.clear();
         self.deleted.clear();
         self.crop_mode = false;
     }
@@ -430,6 +436,31 @@ impl ScanApp {
             .get(&self.page_key(i))
             .copied()
             .unwrap_or(Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)))
+    }
+
+    fn turns(&self, i: usize) -> u8 {
+        self.quarter_turns.get(&self.page_key(i)).copied().unwrap_or(0)
+    }
+
+    /// Turns the current page by 90° (clockwise if `clockwise`). A manual crop
+    /// turns along with the page.
+    fn turn_page(&mut self, clockwise: bool) {
+        let key = self.page_key(self.page);
+        let turns = (self.turns(self.page) + if clockwise { 1 } else { 3 }) % 4;
+        if turns == 0 {
+            self.quarter_turns.remove(&key);
+        } else {
+            self.quarter_turns.insert(key, turns);
+        }
+        if let Some(r) = self.manual_crops.get_mut(&key) {
+            let (x0, y0, x1, y1) = (r.min.x, r.min.y, r.max.x, r.max.y);
+            *r = if clockwise {
+                Rect::from_min_max(egui::pos2(1.0 - y1, x0), egui::pos2(1.0 - y0, x1))
+            } else {
+                Rect::from_min_max(egui::pos2(y0, 1.0 - x1), egui::pos2(y1, 1.0 - x0))
+            };
+        }
+        self.view.fit = true;
     }
 
     fn rotation(&self, i: usize) -> f32 {
@@ -481,7 +512,8 @@ impl ScanApp {
     fn auto_rotate(&mut self) {
         let Some(doc) = self.doc.clone() else { return };
         let key = self.page_key(self.page);
-        match processing::detect_skew(doc.page(self.page, key.1), MAX_ROTATION) {
+        let page = output::turn_quarters(doc.page(self.page, key.1), self.turns(self.page));
+        match processing::detect_skew(&page, MAX_ROTATION) {
             Some(degrees) => {
                 self.set_rotation(degrees);
                 self.message = None;
@@ -609,6 +641,7 @@ impl ScanApp {
         let edits: Vec<output::PageEdit> = (0..doc.pages.len())
             .map(|i| output::PageEdit {
                 tone: self.page_tone(i),
+                quarter_turns: self.turns(i),
                 rotation: self.rotation(i),
                 crop: self.manual_crops.get(&self.page_key(i)).map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]),
             })
@@ -999,6 +1032,14 @@ impl ScanApp {
 
         subpanel(ui, "Rotation", |ui| {
             ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⟲ 90°").on_hover_text("Turn this page counter-clockwise (Shift+R)").clicked() {
+                        self.turn_page(false);
+                    }
+                    if ui.button("⟳ 90°").on_hover_text("Turn this page clockwise (R)").clicked() {
+                        self.turn_page(true);
+                    }
+                });
                 let mut rot = self.rotation(self.page);
                 ui.horizontal(|ui| {
                     ui.label("Rotate");
@@ -1289,8 +1330,13 @@ impl ScanApp {
         let doc = self.doc.clone()?;
         let key = (i, crop && doc.pages[i].cropped.is_some());
         let tone = self.page_tone(i);
-        if self.textures.get(&key).is_none_or(|t| t.tone != tone) {
+        let turns = self.turns(i);
+        if self.textures.get(&key).is_none_or(|t| t.tone != tone || t.turns != turns) {
             let img = tone.apply(doc.page(i, key.1));
+            let img = match turns {
+                0 => img,
+                n => std::borrow::Cow::Owned(output::turn_quarters(&img, n)),
+            };
             let size = Vec2::new(img.width() as f32, img.height() as f32);
             let max_side = ctx.input(|inp| inp.max_texture_side) as u32;
             let rgba = if img.width().max(img.height()) > max_side {
@@ -1301,7 +1347,7 @@ impl ScanApp {
             let color = egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
             let options = TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
             let handle = ctx.load_texture(format!("page-{i}-{}", key.1), color, options);
-            self.textures.insert(key, PageTexture { handle, tone, size });
+            self.textures.insert(key, PageTexture { handle, tone, turns, size });
         }
         self.textures.get(&key).map(|t| (t.handle.id(), t.size))
     }
@@ -1396,13 +1442,18 @@ impl ScanApp {
                 if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                     self.delete_current_page();
                 }
-                let (ccw, cw, grid) = ui.input(|i| {
+                let (ccw, cw, grid, turn, shift) = ui.input(|i| {
                     (
                         i.key_pressed(egui::Key::OpenBracket),
                         i.key_pressed(egui::Key::CloseBracket),
                         i.key_pressed(egui::Key::G),
+                        i.key_pressed(egui::Key::R),
+                        i.modifiers.shift,
                     )
                 });
+                if turn {
+                    self.turn_page(!shift);
+                }
                 if ccw || cw {
                     let rot = self.rotation(self.page);
                     self.set_rotation(rot + if cw { 0.1 } else { -0.1 });
@@ -1804,6 +1855,43 @@ mod tests {
         app.config.show_grid = true;
         let w3 = run_frames(&mut app, &ctx, 30);
         assert!(w3.iter().all(|w| (w - w2[59]).abs() < 0.5), "width changed: {w3:?}");
+    }
+
+    #[test]
+    fn quarter_turns_turn_page_and_crop() {
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        let page = || ScannedPage {
+            full: image::DynamicImage::ImageRgb8(image::RgbImage::new(20, 30)),
+            cropped: None,
+            blank: false,
+        };
+        app.show_document(ScannedDocument::new(vec![page(), page()], 75, 1).unwrap());
+        let key = app.page_key(0);
+        let crop = Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.5, 0.9));
+        app.manual_crops.insert(key, crop);
+
+        app.turn_page(true);
+        assert_eq!(app.turns(0), 1);
+        let r = app.manual_crops[&key];
+        assert!((r.min.x - 0.1).abs() < 1e-6 && (r.min.y - 0.1).abs() < 1e-6, "{r:?}");
+        assert!((r.max.x - 0.8).abs() < 1e-6 && (r.max.y - 0.5).abs() < 1e-6, "{r:?}");
+
+        // The preview texture is turned: 30 × 20.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let (_, size) = app.texture(&ctx, 0, false).unwrap();
+        assert_eq!(size, Vec2::new(30.0, 20.0));
+
+        app.turn_page(false);
+        assert_eq!(app.turns(0), 0);
+        assert!(app.quarter_turns.is_empty());
+        let r = app.manual_crops[&key];
+        assert!((r.min - crop.min).length() < 1e-6 && (r.max - crop.max).length() < 1e-6, "back to the original crop");
+
+        app.turn_page(false);
+        assert_eq!(app.turns(0), 3);
+        assert_eq!(app.turns(1), 0, "other pages are not affected");
     }
 
     #[test]

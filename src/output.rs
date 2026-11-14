@@ -149,10 +149,22 @@ impl Tone {
     }
 }
 
+/// Turns an image clockwise by `n` quarter turns.
+pub fn turn_quarters(img: &DynamicImage, n: u8) -> DynamicImage {
+    match n % 4 {
+        1 => img.rotate90(),
+        2 => img.rotate180(),
+        3 => img.rotate270(),
+        _ => img.clone(),
+    }
+}
+
 /// Changes the user made to one page in the preview.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PageEdit {
     pub tone: Tone,
+    /// Quarter turns clockwise (0…3), applied before the fine rotation.
+    pub quarter_turns: u8,
     /// Rotation in degrees, clockwise; applied before the crop.
     pub rotation: f32,
     /// Manual crop as normalised `[x0, y0, x1, y1]` (0…1) of the rotated page.
@@ -377,6 +389,10 @@ pub fn build(
         };
         let bilevel = matches!(tone, Tone::Threshold(_));
         let img = tone.apply(img);
+        let img = match edit.quarter_turns % 4 {
+            0 => img,
+            n => Cow::Owned(turn_quarters(&img, n)),
+        };
         let img = if edit.rotation.abs() >= 0.005 {
             Cow::Owned(rotate_degrees(&img, edit.rotation, bilevel))
         } else {
@@ -628,6 +644,25 @@ mod tests {
         let out = image::open(&built.files[0]).unwrap().into_luma8();
         assert_eq!(out.get_pixel(100, 20).0[0], 235 - 26);
         assert_eq!(out.get_pixel(100, 105).0[0], 60 - 26);
+    }
+
+    #[test]
+    fn quarter_turns_are_applied_before_the_crop() {
+        // 200 × 280 page with a dark bar in its top quarter.
+        let doc = bar_doc(ColorMode::Gray);
+        let s = ScanSettings { format: OutputFormat::Png, ..Default::default() };
+        let groups = output_groups(&doc, &s, &HashSet::new());
+        // One turn clockwise: landscape, the bar now runs top to bottom on the right.
+        let edit = PageEdit { quarter_turns: 1, ..Default::default() };
+        let built = build(&doc, &s, &[edit], &groups, &|_| {}).unwrap();
+        let out = image::open(&built.files[0]).unwrap().into_luma8();
+        assert_eq!(out.dimensions(), (280, 200));
+        assert!(out.get_pixel(280 - 105, 100).0[0] < 100);
+        // Crop to the right half of the turned page: 140 × 200.
+        let edit = PageEdit { quarter_turns: 1, crop: Some([0.5, 0.0, 1.0, 1.0]), ..Default::default() };
+        let built = build(&doc, &s, &[edit], &groups, &|_| {}).unwrap();
+        let out = image::open(&built.files[0]).unwrap().into_luma8();
+        assert_eq!(out.dimensions(), (140, 200));
     }
 
     #[test]
