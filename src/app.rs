@@ -2,6 +2,7 @@
 //! 1 scanner → 2 scan settings & scan → 3 preview → 4 output format & save.
 //! The central area only shows the zoomable / pannable page preview.
 
+use crate::cli::{self, StartOptions};
 use crate::config::{ColorMode, Config, OutputFormat, PageSize, Source};
 use crate::naming;
 use crate::output::{self, BuiltOutput, ScannedDocument, Tone};
@@ -11,7 +12,7 @@ use egui::{Color32, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 enum JobMsg {
@@ -116,19 +117,38 @@ pub struct ScanApp {
     message: Option<(String, MsgKind)>,
     last_saved: Option<PathBuf>,
     manual_url: String,
+    /// Command-line options (file argument, how to return results to a caller).
+    options: StartOptions,
+    /// Every file saved in this session; shared with `main` for the exit code.
+    saved_files: Arc<Mutex<Vec<PathBuf>>>,
     /// Write config changes to disk (off in tests).
     persist: bool,
 }
 
 impl ScanApp {
-    /// `start_file` is a file named on the command line: its folder becomes the
-    /// save folder and its name the next document name.
-    pub fn new(cc: &eframe::CreationContext<'_>, start_file: Option<PathBuf>) -> Self {
+    /// A file named in `options` sets the save folder and the next document
+    /// name. Saved files are reported to a calling program as `options` says
+    /// and collected in `saved_files`.
+    pub fn new(cc: &eframe::CreationContext<'_>, options: StartOptions, saved_files: Arc<Mutex<Vec<PathBuf>>>) -> Self {
         apply_style(&cc.egui_ctx);
         let mut app = Self::with_config(Config::load());
-        if let Some(path) = start_file {
+        app.saved_files = saved_files;
+        if let Some(path) = options.file.clone() {
             app.apply_start_file(&path);
         }
+        if options.called_by_program() {
+            let note = if options.quit_after_save {
+                "ScanDesk was started by another program: after saving, it closes and hands the document over."
+            } else {
+                "ScanDesk was started by another program: saved documents are handed over to it."
+            };
+            let text = match app.message.take() {
+                Some((m, _)) => format!("{note}\n{m}"),
+                None => note.to_string(),
+            };
+            app.message = Some((text, MsgKind::Info));
+        }
+        app.options = options;
         app.start_discovery(&cc.egui_ctx);
         app
     }
@@ -196,6 +216,8 @@ impl ScanApp {
             message: None,
             last_saved: None,
             manual_url: String::new(),
+            options: StartOptions::default(),
+            saved_files: Arc::default(),
             persist: true,
         }
     }
@@ -303,7 +325,7 @@ impl ScanApp {
                 self.job = None;
                 self.status.clear();
                 match r {
-                    Ok(built) => self.finish_save(built),
+                    Ok(built) => self.finish_save(built, ctx),
                     Err(e) => self.message = Some((format!("Saving failed: {e}"), MsgKind::Error)),
                 }
             }
@@ -613,7 +635,7 @@ impl ScanApp {
     }
 
     /// Moves the written files from the temporary folder to the target folder.
-    fn finish_save(&mut self, built: BuiltOutput) {
+    fn finish_save(&mut self, built: BuiltOutput, ctx: &egui::Context) {
         let Some(dir) = self.config.target_dir.clone() else { return };
         let (targets, final_name) = self.plan_targets(&dir, built.files.len());
         for (from, to) in built.files.iter().zip(&targets) {
@@ -634,8 +656,26 @@ impl ScanApp {
             text.push_str("\n");
             text.push_str(n);
         }
+        self.report_saved(&targets, ctx, &mut text);
         self.message = Some((text, MsgKind::Info));
         self.discard_document();
+    }
+
+    /// Hands the saved files over to a calling program and closes the app if
+    /// it was asked to.
+    fn report_saved(&mut self, targets: &[PathBuf], ctx: &egui::Context, text: &mut String) {
+        let all = {
+            let mut saved = self.saved_files.lock().unwrap_or_else(|e| e.into_inner());
+            saved.extend(targets.iter().cloned());
+            saved.clone()
+        };
+        if let Err(e) = cli::report_saved(&self.options, &all, targets) {
+            text.push_str(&format!("\nCould not write the result file: {e}"));
+            return;
+        }
+        if self.options.quit_after_save {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     // ---- left panel -----------------------------------------------------------------
@@ -1867,6 +1907,34 @@ mod tests {
         app.config.settings.brightness = 10.0;
         assert_eq!(app.page_tone(0), Tone::Adjust { brightness: 10.0, contrast: 0.0 });
         run_frames(&mut app, &ctx, 2);
+    }
+
+    #[test]
+    fn saved_paths_are_handed_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = dir.path().join("result.txt");
+        let mut app = ScanApp::with_config(Config::default());
+        app.persist = false;
+        app.options = StartOptions { result_file: Some(result.clone()), quit_after_save: true, ..Default::default() };
+        app.config.target_dir = Some(dir.path().to_path_buf());
+        app.config.settings.format = OutputFormat::Png;
+        let page = ScannedPage {
+            full: image::DynamicImage::ImageRgb8(image::RgbImage::new(20, 30)),
+            cropped: None,
+            blank: false,
+        };
+        app.show_document(ScannedDocument::new(vec![page], 75, 1).unwrap());
+        app.name = "Brief".into();
+        let doc = app.doc.clone().unwrap();
+        let groups = output::output_groups(&doc, &app.config.settings, &HashSet::new());
+        let built = output::build(&doc, &app.config.settings, &[], &groups, &|_| {}).unwrap();
+        let ctx = egui::Context::default();
+        app.finish_save(built, &ctx);
+
+        let saved = dir.path().join("Brief.png");
+        assert!(saved.is_file());
+        assert_eq!(std::fs::read_to_string(&result).unwrap(), format!("{}\n", saved.display()));
+        assert_eq!(*app.saved_files.lock().unwrap(), vec![saved]);
     }
 
     #[test]
