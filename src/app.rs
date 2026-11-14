@@ -68,6 +68,10 @@ impl Section {
 }
 
 const SECTION_GAP: f32 = 14.0;
+/// Title bars of the subpanels in the preview section.
+const SUBPANEL_BAR: Color32 = Color32::from_gray(40);
+const SUBPANEL_TITLE: Color32 = Color32::from_gray(235);
+const SUBPANEL_ACCENT: Color32 = Color32::from_rgb(90, 160, 230);
 const MAX_ROTATION: f32 = 5.0;
 const GRID_SPACING: f32 = 40.0;
 const WARN: Color32 = Color32::from_rgb(214, 134, 20);
@@ -120,6 +124,7 @@ impl ScanApp {
     /// `start_file` is a file named on the command line: its folder becomes the
     /// save folder and its name the next document name.
     pub fn new(cc: &eframe::CreationContext<'_>, start_file: Option<PathBuf>) -> Self {
+        apply_style(&cc.egui_ctx);
         let mut app = Self::with_config(Config::load());
         if let Some(path) = start_file {
             app.apply_start_file(&path);
@@ -447,6 +452,21 @@ impl ScanApp {
             self.rotations.remove(&key);
         } else {
             self.rotations.insert(key, degrees);
+        }
+    }
+
+    /// Straightens the current page along its detected lines of text.
+    fn auto_rotate(&mut self) {
+        let Some(doc) = self.doc.clone() else { return };
+        let key = self.page_key(self.page);
+        match processing::detect_skew(doc.page(self.page, key.1), MAX_ROTATION) {
+            Some(degrees) => {
+                self.set_rotation(degrees);
+                self.message = None;
+            }
+            None => {
+                self.message = Some(("No lines of text found to straighten this page by.".into(), MsgKind::Info));
+            }
         }
     }
 
@@ -820,157 +840,161 @@ impl ScanApp {
             return;
         };
         let side = self.page % ppd;
-        if docs > 1 {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(cur > 0, egui::Button::new("‹ Prev")).on_hover_text("Previous document (←)").clicked() {
-                    self.flip_document(-1);
-                }
-                ui.label(RichText::new(format!("Document {} of {docs}", cur + 1)).strong());
-                if ui.add_enabled(cur + 1 < docs, egui::Button::new("Next ›")).on_hover_text("Next document (→)").clicked() {
-                    self.flip_document(1);
-                }
-            });
-        }
-        if ppd == 2 {
-            let has = |s: usize| visible[cur].iter().any(|p| p % 2 == s);
-            ui.horizontal(|ui| {
-                ui.label("Side");
-                if ui.add_enabled(has(0), egui::Button::selectable(side == 0, "Front")).on_hover_text("↑").clicked() {
-                    self.set_side(0);
-                }
-                if ui.add_enabled(has(1), egui::Button::selectable(side == 1, "Back")).on_hover_text("↓").clicked() {
-                    self.set_side(1);
-                }
-            });
-        }
-        if doc.pages[self.page].blank {
-            let note = if self.config.settings.skip_blank {
-                "This page looks blank – it will be left out when saving."
-            } else {
-                "This page looks blank."
-            };
-            ui.colored_label(WARN, note);
-        }
-        ui.add_enabled_ui(!busy, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("🗑  Delete page").on_hover_text("Remove this page from the scan (Delete key)").clicked() {
-                    self.delete_current_page();
-                }
-                if ui
-                    .add_enabled(!self.deleted.is_empty(), egui::Button::new("↶  Undo delete"))
-                    .on_hover_text("Bring back the last deleted page")
-                    .clicked()
-                {
-                    self.undo_delete();
-                }
-            });
-        });
-        if !self.deleted.is_empty() {
-            let n = self.deleted.len();
-            ui.small(format!("{n} page{} deleted – not saved.", if n == 1 { "" } else { "s" }));
-        }
-        ui.horizontal(|ui| {
-            if ui.button(" − ").on_hover_text("Zoom out (−)").clicked() {
-                self.zoom_request = Some(1.0 / 1.25);
-            }
-            ui.label(format!("{:.0} %", self.view.zoom * 100.0));
-            if ui.button(" + ").on_hover_text("Zoom in (+)").clicked() {
-                self.zoom_request = Some(1.25);
-            }
-            if ui.button("Fit").on_hover_text("Fit page in window (0)").clicked() {
-                self.view.fit = true;
-            }
-            if ui.button("100 %").on_hover_text("Actual pixels (1)").clicked() {
-                self.zoom_request = Some(1.0 / self.view.zoom);
-            }
-        });
-        ui.small("Drag to pan · pinch or ⌘/Ctrl + scroll to zoom · double-click toggles fit");
 
-        ui.add_space(4.0);
-        let found = doc.edges_found();
-        let pages = doc.pages.len();
-        ui.add_enabled_ui(!busy && found > 0, |ui| {
-            let changed = ui
-                .checkbox(&mut self.config.settings.auto_crop, "Crop to detected page edges")
-                .on_hover_text("Straightens the page and removes the scanner background.")
-                .changed();
-            if changed {
-                self.view.fit = true;
+        subpanel(ui, "Page", |ui| {
+            if docs > 1 {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(cur > 0, egui::Button::new("‹ Prev")).on_hover_text("Previous document (←)").clicked() {
+                        self.flip_document(-1);
+                    }
+                    ui.label(RichText::new(format!("Document {} of {docs}", cur + 1)).strong());
+                    if ui.add_enabled(cur + 1 < docs, egui::Button::new("Next ›")).on_hover_text("Next document (→)").clicked() {
+                        self.flip_document(1);
+                    }
+                });
+            }
+            if ppd == 2 {
+                let has = |s: usize| visible[cur].iter().any(|p| p % 2 == s);
+                ui.horizontal(|ui| {
+                    ui.label("Side");
+                    if ui.add_enabled(has(0), egui::Button::selectable(side == 0, "Front")).on_hover_text("↑").clicked() {
+                        self.set_side(0);
+                    }
+                    if ui.add_enabled(has(1), egui::Button::selectable(side == 1, "Back")).on_hover_text("↓").clicked() {
+                        self.set_side(1);
+                    }
+                });
+            }
+            if doc.pages[self.page].blank {
+                let note = if self.config.settings.skip_blank {
+                    "This page looks blank – it will be left out when saving."
+                } else {
+                    "This page looks blank."
+                };
+                ui.colored_label(WARN, note);
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("🗑  Delete page").on_hover_text("Remove this page from the scan (Delete key)").clicked() {
+                        self.delete_current_page();
+                    }
+                    if ui
+                        .add_enabled(!self.deleted.is_empty(), egui::Button::new("↶  Undo delete"))
+                        .on_hover_text("Bring back the last deleted page")
+                        .clicked()
+                    {
+                        self.undo_delete();
+                    }
+                });
+            });
+            if !self.deleted.is_empty() {
+                let n = self.deleted.len();
+                ui.small(format!("{n} page{} deleted – not saved.", if n == 1 { "" } else { "s" }));
             }
         });
-        if found == 0 {
-            ui.small("No page edges detected – the full scan area is used.");
-        } else if found < pages {
-            ui.small(format!("Edges detected on {found} of {pages} pages."));
-        }
 
-        ui.add_space(4.0);
-        let key = self.page_key(self.page);
-        ui.add_enabled_ui(!busy, |ui| {
+        subpanel(ui, "Zoom", |ui| {
             ui.horizontal(|ui| {
-                if self.crop_mode {
-                    if ui.button("✔  Done cropping").clicked() {
-                        self.crop_mode = false;
+                if ui.button(" − ").on_hover_text("Zoom out (−)").clicked() {
+                    self.zoom_request = Some(1.0 / 1.25);
+                }
+                ui.label(format!("{:.0} %", self.view.zoom * 100.0));
+                if ui.button(" + ").on_hover_text("Zoom in (+)").clicked() {
+                    self.zoom_request = Some(1.25);
+                }
+                if ui.button("Fit").on_hover_text("Fit page in window (0)").clicked() {
+                    self.view.fit = true;
+                }
+                if ui.button("100 %").on_hover_text("Actual pixels (1)").clicked() {
+                    self.zoom_request = Some(1.0 / self.view.zoom);
+                }
+            });
+            ui.small("Drag to pan · pinch or ⌘/Ctrl + scroll to zoom · double-click toggles fit");
+        });
+
+        subpanel(ui, "Crop", |ui| {
+            let found = doc.edges_found();
+            let pages = doc.pages.len();
+            ui.add_enabled_ui(!busy && found > 0, |ui| {
+                let changed = ui
+                    .checkbox(&mut self.config.settings.auto_crop, "Crop to detected page edges")
+                    .on_hover_text("Straightens the page and removes the scanner background.")
+                    .changed();
+                if changed {
+                    self.view.fit = true;
+                }
+            });
+            if found == 0 {
+                ui.small("No page edges detected – the full scan area is used.");
+            } else if found < pages {
+                ui.small(format!("Edges detected on {found} of {pages} pages."));
+            }
+            let key = self.page_key(self.page);
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal(|ui| {
+                    if self.crop_mode {
+                        if ui.button("✔  Done cropping").clicked() {
+                            self.crop_mode = false;
+                            self.view.fit = true;
+                        }
+                    } else if ui.button("✂  Crop…").on_hover_text("Cut away parts of this page").clicked() {
+                        self.crop_mode = true;
                         self.view.fit = true;
                     }
-                } else if ui.button("✂  Crop…").on_hover_text("Cut away parts of this page").clicked() {
-                    self.crop_mode = true;
-                    self.view.fit = true;
-                }
-                let has_crop = self.manual_crops.contains_key(&key);
-                if ui.add_enabled(has_crop, egui::Button::new("Reset crop")).clicked() {
-                    self.manual_crops.remove(&key);
-                    self.view.fit = true;
-                }
+                    let has_crop = self.manual_crops.contains_key(&key);
+                    if ui.add_enabled(has_crop, egui::Button::new("Reset crop")).clicked() {
+                        self.manual_crops.remove(&key);
+                        self.view.fit = true;
+                    }
+                });
             });
-        });
-
-        ui.add_space(4.0);
-        self.tone_controls(ui, busy, doc.color);
-
-        ui.add_space(4.0);
-        ui.add_enabled_ui(!busy, |ui| {
-            let mut rot = self.rotation(self.page);
-            ui.horizontal(|ui| {
-                ui.label("Rotate");
-                ui.spacing_mut().slider_width = 150.0;
-                let slider = egui::Slider::new(&mut rot, -MAX_ROTATION..=MAX_ROTATION)
-                    .step_by(0.05)
-                    .fixed_decimals(2)
-                    .suffix("°")
-                    .clamping(egui::SliderClamping::Always);
-                if ui.add(slider).on_hover_text("Straighten the page; [ and ] turn by 0.1°").changed() {
-                    self.set_rotation(rot);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("⟲ 0.1°").on_hover_text("Turn counter-clockwise ([)").clicked() {
-                    self.set_rotation(rot - 0.1);
-                }
-                if ui.button("⟳ 0.1°").on_hover_text("Turn clockwise (])").clicked() {
-                    self.set_rotation(rot + 0.1);
-                }
-                if ui.add_enabled(rot != 0.0, egui::Button::new("Reset")).clicked() {
-                    self.set_rotation(0.0);
-                }
-            });
-            if ui
-                .checkbox(&mut self.config.show_grid, "Show grid")
-                .on_hover_text("Overlay a grid to check that lines of text run straight (G)")
-                .changed()
-            {
-                ui.ctx().request_repaint();
+            if self.crop_mode {
+                ui.small("Drag the corners or edges of the frame to set the crop area. Drag inside the frame to move it.");
             }
         });
 
-        if self.crop_mode {
-            ui.small("Drag the corners or edges of the frame to set the crop area. Drag inside the frame to move it.");
+        if doc.color != ColorMode::Color {
+            subpanel(ui, "Contrast", |ui| self.tone_controls(ui, busy, doc.color));
         }
-        ui.add_space(4.0);
-        if ui.add_enabled(!busy, egui::Button::new("Continue to Save  ›")).clicked() {
-            self.crop_mode = false;
-            self.open_section = Some(Section::Save);
-        }
+
+        subpanel(ui, "Rotation", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                let mut rot = self.rotation(self.page);
+                ui.horizontal(|ui| {
+                    ui.label("Rotate");
+                    ui.spacing_mut().slider_width = 150.0;
+                    let slider = egui::Slider::new(&mut rot, -MAX_ROTATION..=MAX_ROTATION)
+                        .step_by(0.05)
+                        .fixed_decimals(2)
+                        .suffix("°")
+                        .clamping(egui::SliderClamping::Always);
+                    if ui.add(slider).on_hover_text("Straighten the page; [ and ] turn by 0.1°").changed() {
+                        self.set_rotation(rot);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("⟲ 0.1°").on_hover_text("Turn counter-clockwise ([)").clicked() {
+                        self.set_rotation(rot - 0.1);
+                    }
+                    if ui.button("⟳ 0.1°").on_hover_text("Turn clockwise (])").clicked() {
+                        self.set_rotation(rot + 0.1);
+                    }
+                    if ui.add_enabled(rot != 0.0, egui::Button::new("Reset")).clicked() {
+                        self.set_rotation(0.0);
+                    }
+                    if ui.button("Auto").on_hover_text("Straighten this page along its lines of text").clicked() {
+                        self.auto_rotate();
+                    }
+                });
+                if ui
+                    .checkbox(&mut self.config.show_grid, "Show grid")
+                    .on_hover_text("Overlay a grid to check that lines of text run straight (G)")
+                    .changed()
+                {
+                    ui.ctx().request_repaint();
+                }
+            });
+        });
     }
 
     fn tone_slider(value: &mut f32, range: std::ops::RangeInclusive<f32>) -> egui::Slider<'_> {
@@ -1402,6 +1426,53 @@ impl ScanApp {
 }
 
 /// The page texture drawn into `rect`, turned clockwise by `degrees` around its centre.
+/// A titled, framed group of related controls inside a sidebar section.
+/// Gives buttons a lighter fill and a visible outline in both themes, so they
+/// stand apart from the flat, dark subpanel bars.
+fn apply_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        let dark = style.visuals.dark_mode;
+        let w = &mut style.visuals.widgets;
+        let (fill, hover, active, stroke, hover_stroke) = if dark {
+            (78, 96, 110, 120, 160)
+        } else {
+            (250, 236, 222, 165, 120)
+        };
+        w.inactive.weak_bg_fill = Color32::from_gray(fill);
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(stroke));
+        w.hovered.weak_bg_fill = Color32::from_gray(hover);
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(hover_stroke));
+        w.active.weak_bg_fill = Color32::from_gray(active);
+        for v in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            v.corner_radius = egui::CornerRadius::same(6);
+        }
+    });
+}
+
+/// A group of related controls inside a sidebar section, headed by a dark
+/// grey bar carrying its title.
+fn subpanel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(4.0);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        // Flat and darker than any button, with an accent stripe on the left,
+        // so a bar never reads as something to click.
+        let bar = egui::Frame::new()
+            .fill(SUBPANEL_BAR)
+            .inner_margin(egui::Margin { left: 12, right: 8, top: 5, bottom: 5 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(title).size(15.0).strong().color(SUBPANEL_TITLE));
+            });
+        let r = bar.response.rect;
+        ui.painter().rect_filled(Rect::from_min_size(r.min, Vec2::new(4.0, r.height())), 0.0, SUBPANEL_ACCENT);
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(4, 0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+    });
+}
+
 fn rotated_mesh(tex: egui::TextureId, rect: Rect, degrees: f32) -> egui::Shape {
     let (s, c) = degrees.to_radians().sin_cos();
     let center = rect.center();

@@ -214,6 +214,72 @@ pub fn auto_threshold(img: &DynamicImage) -> u8 {
     (ink as f32 + (paper - ink) as f32 * 0.6).round().clamp(1.0, 254.0) as u8
 }
 
+/// Estimates how far the lines of text on `img` are tilted and returns the
+/// clockwise rotation in degrees (within ±`max_degrees`) that straightens them,
+/// or `None` when the page has too little text to tell.
+///
+/// Projection profile: dark pixels are projected onto the vertical axis for
+/// each candidate angle; the angle at which text lines line up best gives the
+/// sharpest profile (largest squared change between neighbouring rows).
+pub fn detect_skew(img: &DynamicImage, max_degrees: f32) -> Option<f32> {
+    let level = auto_threshold(img);
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let scale = (1500.0 / w.max(h) as f32).min(1.0);
+    let (sw, sh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+    let small = image::imageops::resize(&gray, sw, sh, FilterType::Triangle);
+    let (mx, my) = (sw / 25, sh / 25);
+    let mut ink: Vec<(f32, f32)> = Vec::new();
+    for y in my..sh.saturating_sub(my) {
+        for x in mx..sw.saturating_sub(mx) {
+            if small.get_pixel(x, y)[0] < level {
+                ink.push((x as f32 - sw as f32 / 2.0, y as f32 - sh as f32 / 2.0));
+            }
+        }
+    }
+    let area = ((sw - 2 * mx) * (sh - 2 * my)) as usize;
+    if ink.len() < 500 || ink.len() > area * 2 / 5 {
+        return None;
+    }
+    if ink.len() > 200_000 {
+        let step = ink.len() / 200_000 + 1;
+        ink = ink.into_iter().step_by(step).collect();
+    }
+    let rows = (sw as f32).hypot(sh as f32) as usize + 2;
+    let offset = rows as f32 / 2.0;
+    let mut bins = vec![0u32; rows];
+    let mut score = |deg: f32| -> f64 {
+        let (s, c) = deg.to_radians().sin_cos();
+        bins.iter_mut().for_each(|b| *b = 0);
+        for &(x, y) in &ink {
+            // Row of the point after turning the page clockwise by `deg`.
+            let r = (x * s + y * c + offset) as usize;
+            bins[r.min(rows - 1)] += 1;
+        }
+        bins.windows(2)
+            .map(|w| {
+                let d = w[1] as f64 - w[0] as f64;
+                d * d
+            })
+            .sum()
+    };
+    let best = |score: &mut dyn FnMut(f32) -> f64, from: f32, to: f32, step: f32| {
+        let n = ((to - from) / step).round() as i32;
+        (0..=n)
+            .map(|i| from + i as f32 * step)
+            .map(|a| (a, score(a)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap()
+    };
+    let (coarse, _) = best(&mut score, -max_degrees, max_degrees, 0.25);
+    let lo = (coarse - 0.25).max(-max_degrees);
+    let hi = (coarse + 0.25).min(max_degrees);
+    let (fine, top) = best(&mut score, lo, hi, 0.02);
+    // A page without clear lines (photo, drawing) has a flat score curve.
+    let base = score(fine + if fine > 0.0 { -2.0 } else { 2.0 });
+    (top > base * 1.05).then_some((fine * 100.0).round() / 100.0)
+}
+
 /// Lookup table for brightness and contrast, both −100…100 (0 = unchanged).
 /// Contrast stretches around mid-gray, brightness shifts the result.
 pub fn tone_lut(brightness: f32, contrast: f32) -> [u8; 256] {
@@ -345,6 +411,19 @@ mod tests {
             p.0[0] = v.clamp(0, 255) as u8;
         }
         DynamicImage::ImageLuma8(img)
+    }
+
+    #[test]
+    fn detects_skew_of_text_lines() {
+        let page = text_page(240, 30, 0.05);
+        let straight = detect_skew(&page, 5.0).expect("text lines found");
+        assert!(straight.abs() <= 0.05, "straight page: {straight}");
+        for tilt in [-3.0f32, -0.7, 1.5, 4.0] {
+            let tilted = crate::output::rotate_degrees(&page, tilt, false);
+            let fix = detect_skew(&tilted, 5.0).expect("text lines found");
+            assert!((fix + tilt).abs() <= 0.1, "tilt {tilt}: correction {fix}");
+        }
+        assert_eq!(detect_skew(&text_page(240, 240, 0.0), 5.0), None, "blank page");
     }
 
     #[test]
